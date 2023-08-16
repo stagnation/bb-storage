@@ -63,13 +63,17 @@ func (r *byteStreamChunkReader) Close() {
 
 func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.Buffer {
 	ctxWithCancel, cancel := context.WithCancel(ctx)
+	readOffset := int64(0)
+
 	client, err := ba.byteStreamClient.Read(ctxWithCancel, &bytestream.ReadRequest{
 		ResourceName: digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
+		ReadOffset: readOffset,
 	})
 	if err != nil {
 		cancel()
 		return buffer.NewBufferFromError(err)
 	}
+
 	return buffer.NewCASBufferFromChunkReader(digest, &byteStreamChunkReader{
 		client: client,
 		cancel: cancel,
