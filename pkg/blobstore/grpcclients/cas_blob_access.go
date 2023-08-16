@@ -53,12 +53,18 @@ type resumableByteStreamChunkReader struct {
 	ctx context.Context
 	digest digest.Digest
 	maximumSizeBytes                int
+	// Idempotency marker.
+	// A crutch for avoiding a double read when called again through `cas_validation_chunk_reader`.
+	done bool
 }
 
 func (r *resumableByteStreamChunkReader) Read() ([]byte, error) {
+	if r.done {
+		return nil, io.EOF
+	}
+
 	readOffset := 0
 	resumeAttemptCount := 5 // TODO: add configuration.
-	chunks := make([]*[]byte, 0, resumeAttemptCount)
 
 	expectedSizeBytes := r.digest.GetSizeBytes()
 	if expectedSizeBytes > int64(r.maximumSizeBytes) {
@@ -82,41 +88,54 @@ func (r *resumableByteStreamChunkReader) Read() ([]byte, error) {
 			log.Printf("Resuming bytestream read of digest %#v at offset %v.\n", r.digest, readOffset)
 		}
 
-		client, err := r.byteStreamClient.Read(r.ctx, &bytestream.ReadRequest{
-			ResourceName: r.digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
-			ReadOffset: int64(readOffset),
-		})
+		attempt, err := func() ([]byte, error) {
+			client, err := r.byteStreamClient.Read(r.ctx, &bytestream.ReadRequest{
+				ResourceName: r.digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
+				ReadOffset: int64(readOffset),
+			})
 
-		if err != nil {
-			r.cancel()
-			return nil, util.StatusWrapf(err, "Could not open bytestream for digest %#v.", r.digest)
-		}
-
-		// Try to read the full stream
-		// Just like `toByteSliceViaChunkReader`.
-		withinAttempt := make([]byte, 0, expectedSizeBytes)
-		for {
-			chunk, err := client.Recv()
-			// NB: Presumable the final Read returns empty data and EOF,
-			// so we do not need to append anything in that case,
-			// symmetric with `toByteSliceViaChunkReader`'s loop.
-			if err == io.EOF {
-				// Reached the end, can return data.
-				return data, nil
-			} else if err != nil {
-				// Retry with a new stream.
-				errors = append(errors, err)
-				break
+			if err != nil {
+				r.cancel()
+				return nil, util.StatusWrapf(err, "Could not open bytestream for digest %#v.", r.digest)
 			}
-			withinAttempt = append(withinAttempt, chunk.Data...)
-		}
-		readOffset += len(withinAttempt)
 
-		chunks = append(chunks, &withinAttempt)
-		data = append(data, withinAttempt...)
+			// Try to read the full stream
+			// Just like `toByteSliceViaChunkReader`.
+			withinAttempt := make([]byte, 0, expectedSizeBytes)
+			for {
+				chunk, err := client.Recv()
+				// NB: Presumable the final Read returns empty data and EOF,
+				// so we do not need to append anything in that case,
+				// symmetric with `toByteSliceViaChunkReader`'s loop.
+				if err == io.EOF {
+					// Reached the end, can return data.
+					return withinAttempt, io.EOF
+				} else if err != nil {
+					// Retry with a new stream.
+					errors = append(errors, err)
+					return withinAttempt, err
+				}
+				withinAttempt = append(withinAttempt, chunk.Data...)
+			}
+		}()
+
+		data = append(data, attempt...)
+		if err == io.EOF {
+			// Reached the end, can return data.
+			r.done = true
+			return data, nil
+		}
+		if err != nil {
+			log.Printf("Unexpected control flow, the attempt returned without error or EOF.")
+		}
+
+		// Retry with a new stream.
+		errors = append(errors, err)
+		readOffset += len(data)
 	}
 
 	// Could not resume the download, return all errors seen.
+	r.cancel()
 	return nil, util.StatusFromMultiple(errors)
 }
 
