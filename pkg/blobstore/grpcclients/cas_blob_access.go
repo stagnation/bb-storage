@@ -15,6 +15,8 @@ import (
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type casBlobAccess struct {
@@ -23,6 +25,7 @@ type casBlobAccess struct {
 	capabilitiesClient              remoteexecution.CapabilitiesClient
 	uuidGenerator                   util.UUIDGenerator
 	readChunkSize                   int
+	maximumSizeBytes                int
 }
 
 // NewCASBlobAccess creates a BlobAccess handle that relays any requests
@@ -30,13 +33,14 @@ type casBlobAccess struct {
 // remoteexecution.ContentAddressableStorage services. Those are the
 // services that Bazel uses to access blobs stored in the Content
 // Addressable Storage.
-func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize int) blobstore.BlobAccess {
+func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGenerator, readChunkSize, maximumSizeBytes int) blobstore.BlobAccess {
 	return &casBlobAccess{
 		byteStreamClient:                bytestream.NewByteStreamClient(client),
 		contentAddressableStorageClient: remoteexecution.NewContentAddressableStorageClient(client),
 		capabilitiesClient:              remoteexecution.NewCapabilitiesClient(client),
 		uuidGenerator:                   uuidGenerator,
 		readChunkSize:                   readChunkSize,
+		maximumSizeBytes:                maximumSizeBytes,
 	}
 }
 
@@ -48,6 +52,7 @@ type resumableByteStreamChunkReader struct {
 	cancel context.CancelFunc
 	ctx context.Context
 	digest digest.Digest
+	maximumSizeBytes                int
 }
 
 func (r *resumableByteStreamChunkReader) Read() ([]byte, error) {
@@ -55,13 +60,21 @@ func (r *resumableByteStreamChunkReader) Read() ([]byte, error) {
 	resumeAttemptCount := 5 // TODO: add configuration.
 	chunks := make([]*[]byte, 0, resumeAttemptCount)
 
+	expectedSizeBytes := r.digest.GetSizeBytes()
+	if expectedSizeBytes > int64(r.maximumSizeBytes) {
+		return nil, status.Errorf(codes.InvalidArgument, "Buffer is %d bytes in size, while a maximum of %d bytes is permitted", expectedSizeBytes, r.maximumSizeBytes)
+	}
+	data := make([]byte, 0, expectedSizeBytes)
+	errors := []error{}
+
+	log.Printf("Resumable bystream read of digest %#v.\n", r.digest)
 	for i := 0; i < resumeAttemptCount; i++ {
 		// TODO: less ugly do-while control flow.
 		if i > 0 {
 			if readOffset == 0 {
-				// Nothing was read in the first attempt
+				// Nothing was read in the first attempt.
 				break
-				// TODO: error handling
+				// TODO: error handling.
 				// Here, or at the end of the loop?
 				// If `readOffset` is not incremented in an attempt we can exit.
 			}
@@ -79,21 +92,32 @@ func (r *resumableByteStreamChunkReader) Read() ([]byte, error) {
 			return nil, util.StatusWrapf(err, "Could not open bytestream for digest %#v.", r.digest)
 		}
 
-		chunk, err := client.Recv()
-		// TODO: allow some errors here, and resume.
-		if err != nil {
-			return nil, err
+		// Try to read the full stream
+		// Just like `toByteSliceViaChunkReader`.
+		withinAttempt := make([]byte, 0, expectedSizeBytes)
+		for {
+			chunk, err := client.Recv()
+			// NB: Presumable the final Read returns empty data and EOF,
+			// so we do not need to append anything in that case,
+			// symmetric with `toByteSliceViaChunkReader`'s loop.
+			if err == io.EOF {
+				// Reached the end, can return data.
+				return data, nil
+			} else if err != nil {
+				// Retry with a new stream.
+				errors = append(errors, err)
+				break
+			}
+			withinAttempt = append(withinAttempt, chunk.Data...)
 		}
-		readOffset += len(chunk.Data)
+		readOffset += len(withinAttempt)
 
-		chunks[i] = &chunk.Data
+		chunks = append(chunks, &withinAttempt)
+		data = append(data, withinAttempt...)
 	}
 
-	data := *chunks[0]
-	for i := 1; i < len(chunks); i++ {
-		data = append(data, *chunks[i]...)
-	}
-	return data, nil
+	// Could not resume the download, return all errors seen.
+	return nil, util.StatusFromMultiple(errors)
 }
 
 func (r *resumableByteStreamChunkReader) Close() {
@@ -129,6 +153,7 @@ func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.B
 		byteStreamClient: ba.byteStreamClient,
 		ctx: ctxWithCancel,
 		digest: digest,
+		maximumSizeBytes:                ba.maximumSizeBytes,
 	}, buffer.BackendProvided(buffer.Irreparable(digest)))
 }
 

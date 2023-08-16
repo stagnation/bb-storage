@@ -69,6 +69,7 @@ func toByteSliceViaChunkReader(r ChunkReader, digest digest.Digest, maximumSizeB
 
 	data := make([]byte, 0, expectedSizeBytes)
 	for {
+		// NB: The `digest` is embedded in the ChunkReader, so we do not need it here.
 		chunk, err := r.Read()
 		if err == io.EOF {
 			return data, nil

@@ -99,7 +99,7 @@ func (bac *casBlobAccessCreator) NewCustomBlobAccess(configuration *pb.BlobAcces
 		// TODO: Should we provide a configuration option, so
 		// that digest.KeyWithoutInstance can be used?
 		return BlobAccessInfo{
-			BlobAccess:      grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 65536),
+			BlobAccess:      grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 65536, bac.maximumMessageSizeBytes),
 			DigestKeyFormat: digest.KeyWithInstance,
 		}, "grpc", nil
 	case *pb.BlobAccessConfiguration_ReferenceExpanding:
