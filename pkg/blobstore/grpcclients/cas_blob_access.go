@@ -39,6 +39,42 @@ func NewCASBlobAccess(client grpc.ClientConnInterface, uuidGenerator util.UUIDGe
 	}
 }
 
+// A resumable bytestream reader.
+// This takes the digest and creates the stream when the data is read,
+// and can the resume partial reads inside the `Read` function.
+type resumableByteStreamChunkReader struct {
+	byteStreamClient bytestream.ByteStreamClient
+	cancel context.CancelFunc
+	ctx context.Context
+	digest digest.Digest
+}
+
+func (r *resumableByteStreamChunkReader) Read() ([]byte, error) {
+	// TODO: Add the resuming loop
+	// This is just scaffolding code.
+	readOffset := int64(0)
+
+	client, err := r.byteStreamClient.Read(r.ctx, &bytestream.ReadRequest{
+		ResourceName: r.digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
+		ReadOffset: readOffset,
+	})
+
+	if err != nil {
+		r.cancel()
+		return nil, util.StatusWrapf(err, "Could not open bytestream for digest %#v.", r.digest)
+	}
+
+	chunk, err := client.Recv()
+	if err != nil {
+		return nil, err
+	}
+	return chunk.Data, nil
+}
+
+func (r *resumableByteStreamChunkReader) Close() {
+	// This reader has no background state, the stream is closed within `Read`.
+}
+
 type byteStreamChunkReader struct {
 	client bytestream.ByteStream_ReadClient
 	cancel context.CancelFunc
@@ -63,20 +99,11 @@ func (r *byteStreamChunkReader) Close() {
 
 func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.Buffer {
 	ctxWithCancel, cancel := context.WithCancel(ctx)
-	readOffset := int64(0)
-
-	client, err := ba.byteStreamClient.Read(ctxWithCancel, &bytestream.ReadRequest{
-		ResourceName: digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
-		ReadOffset: readOffset,
-	})
-	if err != nil {
-		cancel()
-		return buffer.NewBufferFromError(err)
-	}
-
-	return buffer.NewCASBufferFromChunkReader(digest, &byteStreamChunkReader{
-		client: client,
+	return buffer.NewCASBufferFromChunkReader(digest, &resumableByteStreamChunkReader{
 		cancel: cancel,
+		byteStreamClient: ba.byteStreamClient,
+		ctx: ctxWithCancel,
+		digest: digest,
 	}, buffer.BackendProvided(buffer.Irreparable(digest)))
 }
 
