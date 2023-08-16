@@ -3,6 +3,7 @@ package grpcclients
 import (
 	"context"
 	"io"
+	"log"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
@@ -50,25 +51,49 @@ type resumableByteStreamChunkReader struct {
 }
 
 func (r *resumableByteStreamChunkReader) Read() ([]byte, error) {
-	// TODO: Add the resuming loop
-	// This is just scaffolding code.
-	readOffset := int64(0)
+	readOffset := 0
+	resumeAttemptCount := 5 // TODO: add configuration.
+	chunks := make([]*[]byte, 0, resumeAttemptCount)
 
-	client, err := r.byteStreamClient.Read(r.ctx, &bytestream.ReadRequest{
-		ResourceName: r.digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
-		ReadOffset: readOffset,
-	})
+	for i := 0; i < resumeAttemptCount; i++ {
+		// TODO: less ugly do-while control flow.
+		if i > 0 {
+			if readOffset == 0 {
+				// Nothing was read in the first attempt
+				break
+				// TODO: error handling
+				// Here, or at the end of the loop?
+				// If `readOffset` is not incremented in an attempt we can exit.
+			}
 
-	if err != nil {
-		r.cancel()
-		return nil, util.StatusWrapf(err, "Could not open bytestream for digest %#v.", r.digest)
+			log.Printf("Resuming bytestream read of digest %#v at offset %v.\n", r.digest, readOffset)
+		}
+
+		client, err := r.byteStreamClient.Read(r.ctx, &bytestream.ReadRequest{
+			ResourceName: r.digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY),
+			ReadOffset: int64(readOffset),
+		})
+
+		if err != nil {
+			r.cancel()
+			return nil, util.StatusWrapf(err, "Could not open bytestream for digest %#v.", r.digest)
+		}
+
+		chunk, err := client.Recv()
+		// TODO: allow some errors here, and resume.
+		if err != nil {
+			return nil, err
+		}
+		readOffset += len(chunk.Data)
+
+		chunks[i] = &chunk.Data
 	}
 
-	chunk, err := client.Recv()
-	if err != nil {
-		return nil, err
+	data := *chunks[0]
+	for i := 1; i < len(chunks); i++ {
+		data = append(data, *chunks[i]...)
 	}
-	return chunk.Data, nil
+	return data, nil
 }
 
 func (r *resumableByteStreamChunkReader) Close() {
