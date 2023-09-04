@@ -112,6 +112,12 @@ type Directory interface {
 	// Function that base types may use to implement calls that
 	// require double dispatching, such as hardlinking and renaming.
 	Apply(arg interface{}) error
+
+	// Mount and Unmount.
+	// This uses `Mountat` functionality, but not `Unmountat`.
+	// see https://github.com/buildbarn/bb-remote-execution/issues/115 for information.
+	Mount(mountpoint path.Component, source string, fstype string) error
+	Unmount(mountpoint path.Component) error
 }
 
 // DirectoryCloser is a Directory handle that can be released.
