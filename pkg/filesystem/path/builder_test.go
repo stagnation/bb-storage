@@ -303,8 +303,8 @@ func TestBuilder(t *testing.T) {
 		require.Equal(t, "/hello/", builder.GetUNIXString())
 	})
 
-	// OnTerminal() does not allow returning information whether the
-	// component is reversible. This means that joining and
+	// OnTerminal() does not allow returning information on whether
+	// the component is reversible. This means that joining and
 	// appending ".." can't necessarily be simplified.
 	t.Run("OnTerminalIsNonReversible", func(t *testing.T) {
 		scopeWalker1 := mock.NewMockScopeWalker(ctrl)
